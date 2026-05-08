@@ -7,6 +7,38 @@ use framehop::Unwinder;
 
 use super::common;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn build_x86_64_asm_fixture(name: &str) -> std::path::PathBuf {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = manifest_dir.join(format!("tests/fixtures/linux/x86_64/{name}.S"));
+    let out_dir = manifest_dir.join("target/test-fixtures/linux/x86_64");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let output = out_dir.join(name);
+
+    if let (Ok(out_meta), Ok(src_meta)) = (output.metadata(), source.metadata()) {
+        if let (Ok(out_mtime), Ok(src_mtime)) = (out_meta.modified(), src_meta.modified()) {
+            if out_mtime >= src_mtime {
+                return output;
+            }
+        }
+    }
+
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let status = std::process::Command::new(cc)
+        .arg("-nostdlib")
+        .arg("-no-pie")
+        .arg("-Wl,--build-id=none")
+        .arg("-Wl,-Ttext=0x1000")
+        .arg("-o")
+        .arg(&output)
+        .arg(&source)
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run C compiler for {source:?}: {err}"));
+    assert!(status.success(), "failed to build {source:?}");
+
+    output
+}
+
 #[test]
 fn test_plt_cfa_expr() {
     let mut cache = CacheX86_64::new();
@@ -142,6 +174,38 @@ fn test_pthread_cfa_expr() {
     assert_eq!(res, Ok(Some(0xbe7042)));
     assert_eq!(regs.sp(), 0x130);
     assert_eq!(regs.bp(), 0x1234);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn test_cfa_expr_with_memory_deref() {
+    let mut cache = CacheX86_64::<_>::new();
+    let mut unwinder = UnwinderX86_64::new();
+    let fixture = build_x86_64_asm_fixture("cfa-deref-expression");
+    common::add_object(&mut unwinder, &fixture, 0x0);
+
+    // cfa-deref-expression.S contains:
+    //
+    //   DW_CFA_def_cfa_expression (DW_OP_breg6(RBP): -40; DW_OP_deref)
+    //
+    // So CFA is read from memory at RBP - 40. The return address still uses the
+    // CIE default rule, RIP=[CFA-8].
+    let mut stack = vec![0u64; 0x400 / 8];
+    stack[0x1d8 / 8] = 0x330; // [RBP - 40] = CFA
+    stack[0x328 / 8] = 0x123456; // [CFA - 8] = return address
+    let mut read_stack = |addr| stack.get((addr / 8) as usize).cloned().ok_or(());
+
+    let mut regs = UnwindRegsX86_64::new(0x1001, 0x80, 0x200);
+    let res = unwinder.unwind_frame(
+        FrameAddress::from_instruction_pointer(0x1001),
+        &mut regs,
+        &mut cache,
+        &mut read_stack,
+    );
+
+    assert_eq!(res, Ok(Some(0x123456)));
+    assert_eq!(regs.sp(), 0x330);
+    assert_eq!(regs.bp(), 0x200);
 }
 
 #[test]
