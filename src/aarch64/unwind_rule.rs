@@ -90,6 +90,7 @@ impl UnwindRule for UnwindRuleAarch64 {
                     if new_sp <= sp {
                         return Err(Error::FramepointerUnwindingMovedBackwards);
                     }
+                    regs.set_sp_is_fp_derived(true);
                     (new_lr, new_sp, new_fp)
                 }
             }
@@ -127,6 +128,20 @@ impl UnwindRule for UnwindRuleAarch64 {
                 fp_storage_offset_from_sp_by_8,
                 lr_storage_offset_from_sp_by_8,
             } => {
+                let fp_storage_offset = i64::from(fp_storage_offset_from_sp_by_8) * 8;
+
+                // If SP was estimated as `fp + 16` by a prior frame-pointer unwind
+                // step, it may not match the real CFA. FP points exactly at the
+                // saved-fp slot, so re-anchor SP from it for LR and CFA computation.
+                let sp = if regs.sp_is_fp_derived()
+                    && fp != 0
+                    && checked_add_signed(sp, fp_storage_offset) != Some(fp)
+                {
+                    checked_add_signed(fp, -fp_storage_offset).unwrap_or(sp)
+                } else {
+                    sp
+                };
+
                 let sp_offset = u64::from(sp_offset_by_16) * 16;
                 let new_sp = sp.checked_add(sp_offset).ok_or(Error::IntegerOverflow)?;
                 let lr_storage_offset = i64::from(lr_storage_offset_from_sp_by_8) * 8;
@@ -134,11 +149,11 @@ impl UnwindRule for UnwindRuleAarch64 {
                     checked_add_signed(sp, lr_storage_offset).ok_or(Error::IntegerOverflow)?;
                 let new_lr =
                     read_stack(lr_location).map_err(|_| Error::CouldNotReadStack(lr_location))?;
-                let fp_storage_offset = i64::from(fp_storage_offset_from_sp_by_8) * 8;
                 let fp_location =
                     checked_add_signed(sp, fp_storage_offset).ok_or(Error::IntegerOverflow)?;
                 let new_fp =
                     read_stack(fp_location).map_err(|_| Error::CouldNotReadStack(fp_location))?;
+                regs.set_sp_is_fp_derived(false);
                 (new_lr, new_sp, new_fp)
             }
             UnwindRuleAarch64::UseFramePointer => {
@@ -190,6 +205,7 @@ impl UnwindRule for UnwindRuleAarch64 {
                 if new_fp <= fp || new_sp <= sp {
                     return Err(Error::FramepointerUnwindingMovedBackwards);
                 }
+                regs.set_sp_is_fp_derived(true);
                 (new_lr, new_sp, new_fp)
             }
             UnwindRuleAarch64::UseFramepointerWithOffsets {
@@ -218,6 +234,7 @@ impl UnwindRule for UnwindRuleAarch64 {
                 if new_fp <= fp || new_sp <= sp {
                     return Err(Error::FramepointerUnwindingMovedBackwards);
                 }
+                regs.set_sp_is_fp_derived(false);
                 (new_lr, new_sp, new_fp)
             }
         };
@@ -260,5 +277,76 @@ mod test {
         assert_eq!(regs.fp(), 0x70);
         let res = UnwindRuleAarch64::UseFramePointer.exec(false, &mut regs, &mut read_stack);
         assert_eq!(res, Ok(None));
+    }
+
+    /// Frame-pointer fallback rules only estimate the caller's SP (`fp + 16`), so
+    /// they must flag the resulting SP as unreliable.
+    #[test]
+    fn test_fp_fallback_marks_sp_unreliable() {
+        // [fp=0x20] -> 0x40 (new fp), [fp+8=0x28] -> 0x100200 (new lr)
+        let stack = [0u64, 0, 0, 0, 0x40, 0x100200, 0, 0];
+        let mut read_stack = |addr| Ok(stack[(addr / 8) as usize]);
+        let mut regs = UnwindRegsAarch64::new(0x100300, 0x10, 0x20);
+        assert!(!regs.sp_is_fp_derived());
+        let res = UnwindRuleAarch64::UseFramePointer.exec(false, &mut regs, &mut read_stack);
+        assert_eq!(res, Ok(Some(0x100200)));
+        assert!(regs.sp_is_fp_derived());
+    }
+
+    /// When SP is only a frame-pointer estimate and the frame-record invariant
+    /// `sp + fp_offset == fp` is violated, an SP-relative rule must re-anchor SP
+    /// on the (reliable) FP. This mirrors the Electron→glib boundary bug: a
+    /// frame-pointer-unwound caller (no `.eh_frame`) leaves SP 0x10 too low, and
+    /// glib's `g_main_context_dispatch` rule (CFA=sp+144, fp@sp+0, lr@sp+8) would
+    /// otherwise read a garbage return address.
+    #[test]
+    fn test_reanchor_sp_when_unreliable() {
+        let idx = |addr: u64| (addr / 8) as usize;
+        let mut stack = [0u64; 64];
+        stack[idx(0x80)] = 0x200; // caller fp, stored at the frame's real sp+0
+        stack[idx(0x88)] = 0x100200; // return address, at real sp+8
+        stack[idx(0x70)] = 0x1111; // garbage at the *wrong* (0x10-low) sp+0
+        stack[idx(0x78)] = 0xdead; // garbage at the *wrong* sp+8
+        let mut read_stack = |addr| Ok(stack[idx(addr)]);
+
+        // Arrive with sp 0x10 too low (0x70) but the correct fp (0x80 == the
+        // function's x29 after `mov x29, sp`), flagged unreliable.
+        let mut regs = UnwindRegsAarch64::new(0x111, 0x70, 0x80);
+        regs.set_sp_is_fp_derived(true);
+
+        let rule = UnwindRuleAarch64::OffsetSpAndRestoreFpAndLr {
+            sp_offset_by_16: 9, // CFA = sp + 144
+            fp_storage_offset_from_sp_by_8: 0,
+            lr_storage_offset_from_sp_by_8: 1,
+        };
+        let res = rule.exec(false, &mut regs, &mut read_stack);
+        assert_eq!(res, Ok(Some(0x100200))); // real return address, not 0xdead
+        assert_eq!(regs.sp(), 0x80 + 144);
+        assert_eq!(regs.fp(), 0x200);
+        assert!(!regs.sp_is_fp_derived());
+    }
+
+    /// A reliable SP must never be re-anchored, even if `sp + fp_offset != fp`
+    /// (which happens legitimately when a function saves x29 but uses it as a
+    /// scratch register rather than a frame pointer).
+    #[test]
+    fn test_no_reanchor_when_sp_reliable() {
+        let idx = |addr: u64| (addr / 8) as usize;
+        let mut stack = [0u64; 64];
+        stack[idx(0x80)] = 0x200; // fp@sp+0
+        stack[idx(0x88)] = 0x100200; // lr@sp+8
+        let mut read_stack = |addr| Ok(stack[idx(addr)]);
+
+        // sp is reliable (default); fp (0x9999) deliberately does NOT match sp+0.
+        let mut regs = UnwindRegsAarch64::new(0x111, 0x80, 0x9999);
+        let rule = UnwindRuleAarch64::OffsetSpAndRestoreFpAndLr {
+            sp_offset_by_16: 9,
+            fp_storage_offset_from_sp_by_8: 0,
+            lr_storage_offset_from_sp_by_8: 1,
+        };
+        let res = rule.exec(false, &mut regs, &mut read_stack);
+        assert_eq!(res, Ok(Some(0x100200))); // read from the given sp, unchanged
+        assert_eq!(regs.sp(), 0x80 + 144);
+        assert_eq!(regs.fp(), 0x200);
     }
 }
